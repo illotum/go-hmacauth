@@ -5,11 +5,12 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
-	"net/http"
+	"hash"
 	"sort"
 	"strings"
 	"time"
-	"log"
+
+	"github.com/valyala/fasthttp"
 )
 
 const (
@@ -20,7 +21,7 @@ const (
 	timestampParam      = "Timestamp"
 
 	// timestamp validation
-	maxNegativeTimeOffset time.Duration = -10 * time.Second
+	maxNegativeTimeOffset time.Duration = -5 * time.Minute
 
 	// parsing bits
 	empty   = ""
@@ -31,7 +32,6 @@ const (
 )
 
 type (
-	middleware func(http.ResponseWriter, *http.Request)
 	KeyLocator func(string) string
 )
 
@@ -39,6 +39,7 @@ type Options struct {
 	SignedHeaders      []string
 	SecretKey          KeyLocator
 	SignatureExpiresIn time.Duration
+	HashLib            func() hash.Hash
 }
 
 type authBits struct {
@@ -62,55 +63,51 @@ func (ab *authBits) SetTimestamp(isoTime string) (err error) {
 	return
 }
 
-func HMACAuth(options Options) middleware {
-	// Validate options
-	if options.SecretKey == nil {
-		panic(secretKeyRequired)
-	}
+func AuthenticateFHTTP(options *Options, ctx *fasthttp.RequestCtx) error {
+	var err error
+	var ab *authBits
 
-	return func(res http.ResponseWriter, req *http.Request) {
-		var (
-			err error
-			ab  *authBits
-		)
+	if ab, err = parseAuthHeader(string(ctx.Request.Header.Peek(authorizationHeader))); err == nil {
+		if err = validateTimestamp(ab.Timestamp, options); err == nil {
+			var sts string
 
-		if ab, err = parseAuthHeader(req.Header.Get(authorizationHeader)); err == nil {
-			if err = validateTimestamp(ab.Timestamp, &options); err == nil {
-				var sts string
-				if sts, err = stringToSign(req, &options, ab.TimestampString); err == nil {
-					if sk := options.SecretKey(ab.APIKey); sk != empty {
-						if ab.Signature != signString(sts, sk) {
-							err = HMACAuthError{invalidSignature}
-						}
-					} else {
-						err = HMACAuthError{invalidAPIKey}
+			if sts, err = stringToSignFHTTP(ctx, options, ab.TimestampString); err == nil {
+				if sk := options.SecretKey(ab.APIKey); sk != empty {
+					if ab.Signature != signString(sts, sk, options) {
+						err = HMACAuthError{invalidSignature}
 					}
+				} else {
+					err = HMACAuthError{invalidAPIKey}
 				}
 			}
 		}
-
-		if err != nil {
-			log.Println(err.Error())
-			http.Error(res, err.Error(), 401)
-		}
 	}
+
+	return err
 }
 
-func signString(str string, secret string) string {
-	hash := hmac.New(sha256.New, []byte(secret))
-	hash.Write([]byte(str))
-	return base64.StdEncoding.EncodeToString(hash.Sum(nil))
+func signString(str string, secret string, options *Options) string {
+	var hashlib hash.Hash
+
+	if options.HashLib == nil {
+		hashlib = hmac.New(sha256.New, []byte(secret))
+	} else {
+		hashlib = hmac.New(options.HashLib, []byte(secret))
+	}
+
+	hashlib.Write([]byte(str))
+	return base64.StdEncoding.EncodeToString(hashlib.Sum(nil))
 }
 
-func stringToSign(req *http.Request, options *Options, timestamp string) (string, error) {
+func stringToSignFHTTP(ctx *fasthttp.RequestCtx, options *Options, timestamp string) (string, error) {
 	var buffer bytes.Buffer
 
 	// Standard
-	buffer.WriteString(req.Method)
+	buffer.Write(ctx.Request.Header.Method())
 	buffer.WriteString(newline)
-	buffer.WriteString(req.Host)
+	buffer.Write(ctx.Request.Header.Host())
 	buffer.WriteString(newline)
-	buffer.WriteString(req.URL.RequestURI())
+	buffer.Write(ctx.Request.URI().RequestURI())
 	buffer.WriteString(newline)
 	buffer.WriteString(timestamp)
 	buffer.WriteString(newline)
@@ -118,11 +115,11 @@ func stringToSign(req *http.Request, options *Options, timestamp string) (string
 	// Headers
 	sort.Strings(options.SignedHeaders)
 	for _, header := range options.SignedHeaders {
-		val := req.Header.Get(header)
-		if val == empty {
+		val := ctx.Request.Header.Peek(header)
+		if len(val) == 0 {
 			return empty, HeaderMissingError{header}
 		}
-		buffer.WriteString(val)
+		buffer.Write(val)
 		buffer.WriteString(newline)
 	}
 
